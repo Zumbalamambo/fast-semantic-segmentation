@@ -152,28 +152,38 @@ class FilterPruner(object):
                         results.append(nr)
         return results
 
-    def _prune_conv_node(self, conv_node_name, idxs=None):
+    def _get_conv_weights_node_name(self, conv_node_name):
         curr_node = self.nodes_map[conv_node_name]
         weights_node_name = graph_utils.remove_ref_from_node_name(
                 curr_node.input[1])
-        # If this node has had input channels removed before,
-        # we need to reuse that instance of weight values
-        if weights_node_name in self.output_values_map:
-            weights = self.output_values_map[weights_node_name]
-        else:
-            weights = self.values_map[weights_node_name]
-        # plot weights if needed
+        return weights_node_name
+
+    def _get_prune_idxs(self, weights_node_name):
+        weights = self.values_map[weights_node_name]
+        # plot weights for debug
         if self.interactive_mode:
-            plot_magnitude_of_weights(conv_node_name, weights,
+            plot_magnitude_of_weights(weights_node_name, weights,
                                       self.compression_factor)
-        (kernel_h, kernel_w, batch, num_filters) = weights.shape
         # Find filters to keep
+        num_filters = weights.shape[-1]
         num_filters_to_keep = int(num_filters*self.compression_factor)
         weight_magnitudes = np.abs(weights).sum((0,1,2))
         smallest_idxs = np.argsort(-weight_magnitudes)
         top_smallest_idxs = np.sort(smallest_idxs[:num_filters_to_keep])
         prune_idxs = np.zeros(num_filters).astype(bool)
         prune_idxs[top_smallest_idxs] = True
+        return prune_idxs
+
+    def _prune_conv_node(self, conv_node_name, idxs=None):
+        weights_node_name = self._get_conv_weights_node_name(conv_node_name)
+        # If this node has had input channels removed before,
+        # we need to reuse that instance of weight values
+        if weights_node_name in self.output_values_map:
+            weights = self.output_values_map[weights_node_name]
+        else:
+            weights = self.values_map[weights_node_name]
+        # Grab the indices of the weights to prune
+        prune_idxs = self._get_prune_idxs(weights_node_name)
         if idxs is not None:
             prune_idxs = idxs
         # Apply by actually changing shape, or simulate pruning
@@ -209,7 +219,7 @@ class FilterPruner(object):
             self.output_values_map[var_name] = pruned_value
         return next_bn_node_name
 
-    def _remove_conv_param_channels(self, next_conv_node_name, prune_idxs):
+    def _remove_conv_param_channels(self, next_conv_node_name, src_prune_idxs):
         curr_node = self.nodes_map[next_conv_node_name]
         weights_node_name = graph_utils.remove_ref_from_node_name(
                 curr_node.input[1])
@@ -220,6 +230,14 @@ class FilterPruner(object):
         else:
             weights = self.values_map[weights_node_name]
         (kernel_h, kernel_w, batch, num_filters) = weights.shape
+        # In order to prune the last Conv Op in the PSPModule, we need
+        # to pad the channels of src_prune_idxs to match that output of the
+        # Concat op. See the PSP prune config for more information.
+        prune_idxs = np.copy(src_prune_idxs)
+        if batch != len(src_prune_idxs):
+            prune_idxs.resize(batch)
+            prune_idxs[len(src_prune_idxs):] = True # keep extra channels
+        # Soft apply if we need to retrain without changing variable shape
         if not self.soft_apply:
             updated_kernels = weights[:,:,prune_idxs,:]
         else:
@@ -240,13 +258,21 @@ class FilterPruner(object):
             print('\x1b[6;30;44m'+'Applying Pruning Spec to `%s`!\x1b[0m' % curr_node_name)
 
             if curr_node.op != "Conv2D":
-                raise ValueError("Only Conv nodes can be prunned with the"
-                                 " FilterPruner compressor.")
+                raise ValueError("Only Conv nodes can be prunned with the "
+                                 "FilterPruner compressor.")
             # Prune the current conv we are dealing with
+            source_node_idxs = None
             if source_node_name:
-                source_node_idxs = pruned_node_idxs[source_node_name]
-            else:
-                source_node_idxs = None
+                # TODO(oandrien): This is redundant, should fix traversal instead
+                # Look ahead if we havent encountered the node yet.
+                if source_node_name not in pruned_node_idxs:
+                    import pdb; pdb.set_trace()
+                    weights_node_name = self._get_conv_weights_node_name(
+                        source_node_name)
+                    source_node_idxs = self._get_prune_idxs(weights_node_name)
+                else:
+                    source_node_idxs = pruned_node_idxs[source_node_name]
+            # Actually prune the variable now
             new_weights_node_name, prune_idxs = self._prune_conv_node(
                         curr_node_name, source_node_idxs)
             pruned_node_idxs[curr_node_name] = prune_idxs
@@ -289,6 +315,8 @@ class FilterPruner(object):
                     next_node_name, "Conv2D")
             elif next_node.op == "Conv2D":
                 next_conv_node_names = [next_node_name]
+            elif next_node_name == self.output_node:
+                return None
             else:
                 raise ValueError('Incompatable model file.')
         return next_bn_node_names + next_conv_node_names
@@ -355,8 +383,8 @@ class FilterPruner(object):
     def save(self, output_checkpoint_dir, output_checkpoint_name):
         output_checkpoint_path = os.path.join(
                 output_checkpoint_dir, output_checkpoint_name)
-        output_def_path = os.path.join(
-                output_checkpoint_dir, "prunned_graph.pbtxt")
+        # output_def_path = os.path.join(
+        #         output_checkpoint_dir, "prunned_graph.pbtxt")
         output_graph = tf.Graph()
         with output_graph.as_default():
             session = tf.Session(graph=output_graph)
@@ -382,7 +410,7 @@ class FilterPruner(object):
             write_saver.save(session, output_checkpoint_path)
             print('Saving pruned model checkpoint to {}'.format(
                 output_checkpoint_path))
-            output_graph_def = output_graph.as_graph_def()
-            f = tf.gfile.FastGFile(output_def_path, "w")
-            f.write(str(output_graph_def))
+            # output_graph_def = output_graph.as_graph_def()
+            # f = tf.gfile.FastGFile(output_def_path, "w")
+            # f.write(str(output_graph_def))
         session.close()
